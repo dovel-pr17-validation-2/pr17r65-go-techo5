@@ -1,0 +1,275 @@
+// Package microphone is the array's tuning knobs: how the seven microphones are combined, how hard
+// they are driven, and whether the mix is leveled before anything listens to it.
+package microphone
+
+import (
+	"log/slog"
+	"math"
+	"sync"
+
+	esphome "github.com/ygelfand/go-esphome-device"
+
+	"github.com/HuskerMinion/techo5/echod/internal/component"
+	"github.com/HuskerMinion/techo5/echod/internal/config"
+	"github.com/HuskerMinion/techo5/echod/internal/hardware/mic"
+)
+
+func init() {
+	component.Register(component.Device, Get(), component.Order(5))
+}
+
+// Names begin with the same word rather than being grouped into a sub-device: Home Assistant shows a
+// sub-device as a device of its own, which would put a bare "Microphone" device in the list for
+// every satellite in the house.
+type Microphone struct {
+	aspSelected *esphome.Select
+	aspActive   *esphome.TextSensor
+	mixing      *esphome.Select
+	gain        *esphome.Number
+	leveling    *esphome.Switch
+	cancel      *esphome.Switch
+	engine      *esphome.Select
+	denoise     *esphome.Switch
+	ends        *esphome.Switch
+	pause       *esphome.Number // how long a pause ends a turn
+	sensitivity *esphome.Number
+}
+
+var (
+	once   sync.Once
+	shared *Microphone
+)
+
+func Get() *Microphone {
+	once.Do(func() { shared = build() })
+	return shared
+}
+
+func build() *Microphone {
+	m := &Microphone{
+		aspSelected: &esphome.Select{Base: esphome.Base{
+			ObjectID: "microphone_asp_selected", Name: "Microphone ASP selected",
+			Icon: "mdi:microphone-settings", Category: esphome.CategoryConfig,
+		}},
+		aspActive: &esphome.TextSensor{Base: esphome.Base{
+			ObjectID: "microphone_asp_active", Name: "Microphone ASP active",
+			Icon: "mdi:microphone", Category: esphome.CategoryDiagnostic,
+		}},
+		mixing: &esphome.Select{
+			Base: esphome.Base{
+				ObjectID: "microphone_mixing",
+				Name:     "Microphone mixing",
+				Icon:     "mdi:microphone-settings",
+				Category: esphome.CategoryConfig,
+			},
+		},
+		leveling: &esphome.Switch{
+			Base: esphome.Base{
+				ObjectID: "microphone_leveling",
+				Name:     "Microphone leveling",
+				Icon:     "mdi:signal-variant",
+				Category: esphome.CategoryConfig,
+			},
+		},
+		cancel: &esphome.Switch{
+			Base: esphome.Base{
+				ObjectID: "microphone_cancel_echo",
+				Name:     "Microphone echo cancellation",
+				Icon:     "mdi:waveform",
+				Category: esphome.CategoryConfig,
+			},
+		},
+		engine: &esphome.Select{
+			Base: esphome.Base{
+				ObjectID: "microphone_echo_canceller",
+				Name:     "Microphone echo canceller",
+				Icon:     "mdi:waveform",
+				Category: esphome.CategoryConfig,
+			},
+		},
+		denoise: &esphome.Switch{
+			Base: esphome.Base{
+				ObjectID: "microphone_noise_reduction",
+				Name:     "Microphone noise reduction",
+				Icon:     "mdi:blur-off",
+				Category: esphome.CategoryConfig,
+			},
+		},
+		ends: &esphome.Switch{
+			Base: esphome.Base{
+				ObjectID: "microphone_end_of_speech",
+				Name:     "End of speech on the device",
+				Icon:     "mdi:account-voice",
+				Category: esphome.CategoryConfig,
+			},
+		},
+		pause: &esphome.Number{
+			Base: esphome.Base{
+				ObjectID: "microphone_end_of_speech_pause",
+				Name:     "End of speech pause",
+				Icon:     "mdi:timer-sand",
+				Category: esphome.CategoryConfig,
+			},
+			Min: config.MinEndPause / 10.0, Max: config.MaxEndPause / 10.0, Step: 0.1, Unit: "s",
+			Mode: esphome.NumberBox,
+		},
+		sensitivity: &esphome.Number{
+			Base: esphome.Base{
+				ObjectID: "microphone_sensitivity",
+				Name:     "Room sensitivity",
+				Icon:     "mdi:motion-sensor",
+				Category: esphome.CategoryConfig,
+			},
+			Min: 4, Max: 20, Step: 1, Unit: "dB",
+			Mode: esphome.NumberBox,
+		},
+		gain: &esphome.Number{
+			Base: esphome.Base{
+				ObjectID: "microphone_gain",
+				Name:     "Microphone gain",
+				Icon:     "mdi:volume-plus",
+				Category: esphome.CategoryConfig,
+			},
+			Min: 0, Max: 59, Step: 1, Unit: "dB",
+			Mode: esphome.NumberBox,
+		},
+	}
+
+	for _, b := range []*esphome.Base{
+		&m.aspSelected.Base, &m.aspActive.Base,
+		&m.mixing.Base, &m.gain.Base, &m.leveling.Base, &m.cancel.Base, &m.engine.Base, &m.denoise.Base,
+		&m.ends.Base, &m.pause.Base, &m.sensitivity.Base,
+	} {
+		b.DeviceID = component.DeviceMicrophone
+	}
+
+	source := mic.Get()
+	m.aspSelected.Options = config.Labels(config.ASPModes())
+	m.aspSelected.OnCommand = func(label string) {
+		want, ok := config.ByLabel(config.ASPModes(), label)
+		if !ok {
+			return
+		}
+		// Persistence is immediate and independent of launch/READY/PCM outcome.
+		if err := config.Set().Microphone().ASP(want); err != nil {
+			slog.Error("saving ASP selection failed", "err", err)
+		}
+		m.aspSelected.Set(source.SetASP(want).Label())
+	}
+	source.SetASPActiveObserver(func(v config.ASPMode) { m.aspActive.Set(v.Label()) })
+	component.Bind(m.mixing, mic.Mixings(), source.SetMixing, config.Set().Microphone().Mixing)
+	engines := config.CancelEngines()
+	if !mic.HaveWebRTC() {
+		engines = []config.CancelEngine{config.CancelBuiltin}
+	}
+	component.Bind(m.engine, engines, setEngine, config.Set().Microphone().CancelEngine)
+
+	m.leveling.OnCommand = func(on bool) {
+		m.leveling.Set(on)
+		source.SetLeveling(on)
+		if err := config.Set().Microphone().Leveling(on); err != nil {
+			slog.Error("saving the microphone leveling failed", "err", err)
+		}
+	}
+
+	m.cancel.OnCommand = func(on bool) {
+		m.cancel.Set(on)
+		source.SetCanceling(on)
+		if err := config.Set().Microphone().Cancel(on); err != nil {
+			slog.Error("saving the echo cancellation setting failed", "err", err)
+		}
+	}
+
+	m.denoise.OnCommand = func(on bool) {
+		m.denoise.Set(on)
+		source.SetDenoising(on)
+		if err := config.Set().Microphone().Denoise(on); err != nil {
+			slog.Error("saving the noise reduction setting failed", "err", err)
+		}
+	}
+
+	// Read by each turn as it opens, so there is nothing to apply here.
+	m.ends.OnCommand = func(on bool) {
+		m.ends.Set(on)
+		if err := config.Set().Microphone().DeviceEnds(on); err != nil {
+			slog.Error("saving the end of speech setting failed", "err", err)
+		}
+	}
+
+	// Read by each turn as it opens too.
+	m.pause.OnCommand = func(v float32) {
+		tenths := config.Microphone{EndPause: int(math.Round(float64(v) * 10))}.EndPauseTenths()
+		m.pause.Set(float32(tenths) / 10)
+		if err := config.Set().Microphone().EndPause(tenths); err != nil {
+			slog.Error("saving the end of speech pause failed", "err", err)
+		}
+	}
+
+	m.sensitivity.OnCommand = func(v float32) {
+		m.sensitivity.Set(v)
+		source.SetSensitivity(int(v))
+		if err := config.Set().Microphone().Sensitivity(int(v)); err != nil {
+			slog.Error("saving the room sensitivity failed", "err", err)
+		}
+	}
+
+	m.gain.OnCommand = func(v float32) {
+		m.gain.Set(v)
+		if err := mic.SetGain(int(v)); err != nil {
+			slog.Error("saving the microphone gain failed", "err", err)
+		}
+	}
+	return m
+}
+
+func (m *Microphone) Name() string { return "microphone settings" }
+
+func (m *Microphone) Entities() []esphome.Entity {
+	return append([]esphome.Entity{m.aspSelected, m.aspActive, m.mixing, m.gain, m.leveling, m.cancel, m.engine, m.denoise, m.ends, m.pause,
+		m.sensitivity},
+		buildEntities()...)
+}
+
+// setEngine applies a canceller choice and reports what the source settled on, which is the
+// built-in filter when the WebRTC helper is not on this image.
+func setEngine(e config.CancelEngine) config.CancelEngine {
+	if e == "" {
+		e = config.CancelBuiltin
+	}
+	return config.CancelEngine(mic.Get().SetCancelEngine(string(e)))
+}
+
+// Restore puts the knobs back. The analog gain is only published here: the capture service applies
+// it when it opens the device, which is the only moment it can be set.
+func (m *Microphone) Restore(c config.Config) {
+	source := mic.Get()
+	m.aspSelected.Set(source.SetASP(c.Microphone.ASP).Label())
+	component.Restore(m.mixing, c.Microphone.Mixing, source.SetMixing)
+
+	m.leveling.Set(c.Microphone.Leveling)
+	source.SetLeveling(c.Microphone.Leveling)
+	slog.Info("restored", "what", m.leveling.ObjectID, "using", c.Microphone.Leveling)
+
+	m.cancel.Set(c.Microphone.Cancel)
+	source.SetCanceling(c.Microphone.Cancel)
+	slog.Info("restored", "what", m.cancel.ObjectID, "using", c.Microphone.Cancel)
+
+	component.Restore(m.engine, c.Microphone.CancelEngine, setEngine)
+
+	m.denoise.Set(c.Microphone.Denoise)
+	source.SetDenoising(c.Microphone.Denoise)
+	slog.Info("restored", "what", m.denoise.ObjectID, "using", c.Microphone.Denoise)
+
+	m.ends.Set(!c.Microphone.PipelineEnds)
+	slog.Info("restored", "what", m.ends.ObjectID, "using", !c.Microphone.PipelineEnds)
+
+	m.pause.Set(float32(c.Microphone.EndPauseTenths()) / 10)
+	slog.Info("restored", "what", m.pause.ObjectID, "using", c.Microphone.EndPauseTenths())
+
+	m.sensitivity.Set(float32(c.Microphone.Sensitivity))
+	source.SetSensitivity(c.Microphone.Sensitivity)
+	slog.Info("restored", "what", m.sensitivity.ObjectID, "using", c.Microphone.Sensitivity)
+
+	m.gain.Set(float32(c.Microphone.Gain))
+	slog.Info("restored", "what", m.gain.ObjectID, "using", c.Microphone.Gain)
+}

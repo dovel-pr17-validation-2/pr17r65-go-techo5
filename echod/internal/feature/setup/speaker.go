@@ -1,0 +1,276 @@
+package setup
+
+import (
+	"fmt"
+	"html"
+	"log/slog"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/HuskerMinion/techo5/echod/internal/config"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/media"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/phone"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/voice"
+	"github.com/HuskerMinion/techo5/echod/internal/hardware/speaker"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/safe"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/wake"
+)
+
+// speakerSection is what is changed most on Sound: the volume, the wake word, quiet hours, do
+// not disturb, and on a device with a jack where the sound goes. The Dot has no screen to set these on.
+//
+// Each field carries what the page showed beside it, and a save changes only what was changed on the
+// page: a volume turned up by voice while the page sat open is not put back by saving the wake word.
+func speakerSection(w http.ResponseWriter, token string) {
+	c := config.Get()
+	p := media.Get()
+	fieldsetOpen(w, "speaker", "Speaker and voice")
+	fmt.Fprint(w, `<form method="post" action="/setup/save">`)
+	hidden(w, token, "speaker")
+	vol := p.Volume()
+	fmt.Fprintf(w, `<label for="volume">Volume, 0 to %d</label>
+	 <input id="volume" name="volume" type="number" min="0" max="%d" value="%d"><input type="hidden" name="was_volume" value="%d">`,
+		media.VolumeSteps, media.VolumeSteps, vol, vol)
+	if p.SpeakerGainAvailable() {
+		gain := p.SpeakerGain()
+		fmt.Fprintf(w, `<label for="gain">Speaker gain, dB (0 is normal)</label>
+	 <input id="gain" name="gain" type="number" min="0" max="%d" step="1" value="%d"><input type="hidden" name="was_gain" value="%d">
+	 <p>Boosts can distort, especially at high volume or with raised bass or treble, and make the wake word harder to catch over loud music. Set 0 dB to restore normal gain.</p>`,
+			config.SpeakerGainMax, gain, gain)
+	}
+	if p.LouderTopAvailable() {
+		top := p.LouderTop()
+		fmt.Fprintf(w, `<p><label><input type="checkbox" name="top" value="yes" style="width:auto"%s> Louder top volume:
+	  the steps above 16 go up to 8 dB hotter into the tuning, for music that stays too quiet at full volume; can distort with Speaker gain raised</label><input type="hidden" name="was_top" value="%t"></p>`, checkedIf(top), top)
+	}
+	if p.JackSleepAvailable() {
+		js := p.JackSleep()
+		fmt.Fprintf(w, `<p><label><input type="checkbox" name="jack_sleep" value="yes" style="width:auto"%s> Headphone jack sleeps when idle:
+	  the jack's output switches off after 10 seconds of silence, so powered speakers on it don't hiss; a small pop when it switches off and on</label><input type="hidden" name="was_jack_sleep" value="%t"></p>`, checkedIf(js), js)
+	}
+	louder := c.Speaker.LouderSpeech
+	fmt.Fprintf(w, `<p><label><input type="checkbox" name="louder" value="yes" style="width:auto"%s> Louder speech:
+	  replies and announcements compressed so the quiet parts of words are heard; music is not changed</label><input type="hidden" name="was_louder" value="%t"></p>`, checkedIf(louder), louder)
+
+	if models := wake.Lib().Ours(); len(models) > 0 {
+		cur := c.Wake.Slot(0).ID
+		fmt.Fprint(w, `<label for="wakeword">Wake word</label><select id="wakeword" name="wakeword">`)
+		// What is in force now is always the one shown, even when it is none of these (off, or a word
+		// since removed): otherwise the list would show the first, and a save would put it in force.
+		listed := false
+		for _, m := range models {
+			listed = listed || m.ID == cur
+		}
+		if !listed {
+			label := "Off"
+			if cur != "" {
+				label = strings.ReplaceAll(cur, "_", " ")
+			}
+			fmt.Fprintf(w, `<option value="%s" selected>%s</option>`, html.EscapeString(cur), html.EscapeString(label))
+		}
+		for _, m := range models {
+			label := m.Phrase
+			if label == "" {
+				label = strings.ReplaceAll(m.ID, "_", " ")
+			}
+			fmt.Fprintf(w, `<option value="%s"%s>%s</option>`, html.EscapeString(m.ID), selected(m.ID == cur), html.EscapeString(label))
+		}
+		fmt.Fprintf(w, `</select><input type="hidden" name="was_wakeword" value="%s">`, html.EscapeString(cur))
+	}
+
+	choiceField(w, "quiet", "Quiet hours: the device's own sounds only; alarms and timers still sound", p.QuietChoices(), p.Quiet())
+	night := p.NightVolume()
+	fmt.Fprintf(w, `<label for="night">Night volume: turned down to this as quiet hours start, and back after; 0 for none</label>
+	 <input id="night" name="night" type="number" min="0" max="%d" value="%d"><input type="hidden" name="was_night" value="%d">`,
+		media.VolumeSteps, night, night)
+	voiceOff, callOff := p.VoiceOffset(), p.CallOffset()
+	fmt.Fprintf(w, `<label for="voicevol">Voice volume: replies and announcements, in steps from the volume (0 is the same, -5 quieter, 5 louder; never the music)</label>
+	 <input id="voicevol" name="voicevol" type="number" min="-%d" max="%d" value="%d"><input type="hidden" name="was_voicevol" value="%d">
+	 <label for="callvol">Call volume: intercom and phone calls, in steps from the volume</label>
+	 <input id="callvol" name="callvol" type="number" min="-%d" max="%d" value="%d"><input type="hidden" name="was_callvol" value="%d">`,
+		media.VolumeSteps, media.VolumeSteps, voiceOff, voiceOff, media.VolumeSteps, media.VolumeSteps, callOff, callOff)
+	if speaker.HasJack {
+		choiceField(w, "output", "Audio output", media.OutputChoices(), p.Output())
+	}
+	if speaker.Get().CanStereo() {
+		st := p.Stereo()
+		fmt.Fprintf(w, `<p><label><input type="checkbox" name="stereo" value="yes" style="width:auto"%s> Stereo speakers:
+	  left and right on their own speakers; can make the wake word harder to catch over music</label><input type="hidden" name="was_stereo" value="%t"></p>`, checkedIf(st), st)
+	}
+
+	dnd := c.Home.DoNotDisturb
+	fmt.Fprintf(w, `<p><label><input type="checkbox" name="dnd" value="yes" style="width:auto"%s> Do not disturb: intercom
+	  calls from other rooms are turned away</label><input type="hidden" name="was_dnd" value="%t"></p>`, checkedIf(dnd), dnd)
+	fmt.Fprint(w, `<p><button type="submit">Save</button></p></form></fieldset>`)
+}
+
+// choiceField is a list of choices with what the page showed beside it.
+func choiceField(w http.ResponseWriter, name, label string, choices []string, cur string) {
+	fmt.Fprintf(w, `<label for="%s">%s</label><select id="%s" name="%s">`, name, html.EscapeString(label), name, name)
+	for _, o := range choices {
+		fmt.Fprintf(w, `<option%s>%s</option>`, selected(o == cur), html.EscapeString(o))
+	}
+	fmt.Fprintf(w, `</select><input type="hidden" name="was_%s" value="%s">`, name, html.EscapeString(cur))
+}
+
+func checkedIf(on bool) string {
+	if on {
+		return " checked"
+	}
+	return ""
+}
+
+// changed is a field's value when the page sent one that differs from what it showed.
+func changed(r *http.Request, name string) (string, bool) {
+	if _, ok := r.PostForm[name]; !ok {
+		return "", false
+	}
+	v := r.PostFormValue(name)
+	return v, v != r.PostFormValue("was_"+name)
+}
+
+// level reads a 0..VolumeSteps field that changed, and whether it did; a bad one is a problem to show.
+func level(r *http.Request, name, what string) (n int, ok bool, problem string) {
+	v, ok := changed(r, name)
+	if !ok {
+		return 0, false, ""
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n < 0 || n > media.VolumeSteps {
+		return 0, false, fmt.Sprintf("the %s is a number from 0 to %d", what, media.VolumeSteps)
+	}
+	return n, true, ""
+}
+
+// offset reads a -VolumeSteps..VolumeSteps field that changed, as level does for a level.
+func offset(r *http.Request, name, what string) (n int, ok bool, problem string) {
+	v, ok := changed(r, name)
+	if !ok {
+		return 0, false, ""
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n < -media.VolumeSteps || n > media.VolumeSteps {
+		return 0, false, fmt.Sprintf("the %s is a number from -%d to %d", what, media.VolumeSteps, media.VolumeSteps)
+	}
+	return n, true, ""
+}
+
+func saveSpeaker(r *http.Request) string {
+	_ = r.ParseForm()
+	p := media.Get()
+	// The numbers are read before anything is saved, so a mistyped one saves nothing rather than half.
+	vol, volChanged, problem := level(r, "volume", "volume")
+	if problem != "" {
+		return problem
+	}
+	night, nightChanged, problem := level(r, "night", "night volume")
+	if problem != "" {
+		return problem
+	}
+	voiceOff, voiceChanged, problem := offset(r, "voicevol", "voice volume")
+	if problem != "" {
+		return problem
+	}
+	callOff, callChanged, problem := offset(r, "callvol", "call volume")
+	if problem != "" {
+		return problem
+	}
+	gain, gainChanged, problem := gainLevel(r, p.SpeakerGainAvailable())
+	if problem != "" {
+		return problem
+	}
+	if gainChanged {
+		if err := p.SetSpeakerGain(gain); err != nil {
+			return "the speaker gain could not be saved: " + err.Error()
+		}
+	}
+	if volChanged {
+		p.Adjust(vol - p.Volume())
+	}
+	// Off is shown, but not chosen here: the page offers words, and the screen or Home Assistant turns it off.
+	if v, ok := changed(r, "wakeword"); ok && v != "" {
+		known := false
+		for _, m := range wake.Lib().Ours() {
+			known = known || m.ID == v
+		}
+		if !known {
+			return "that wake word is not on this device"
+		}
+		// Loading a model takes a moment; the screen does it aside too.
+		safe.Go("wake word from the setup page", func() { voice.Get().ChooseWakeWord(v) })
+	}
+	if v, ok := changed(r, "quiet"); ok {
+		if !oneOf(v, p.QuietChoices()) {
+			return "that is not one of the quiet hours"
+		}
+		p.SetQuiet(v)
+	}
+	if nightChanged {
+		p.SetNightVolume(night)
+	}
+	if voiceChanged {
+		p.SetVoiceOffset(voiceOff)
+	}
+	if callChanged {
+		p.SetCallOffset(callOff)
+	}
+	if v, ok := changed(r, "output"); ok && speaker.HasJack {
+		if !oneOf(v, media.OutputChoices()) {
+			return "that is not one of the outputs"
+		}
+		p.SetOutput(v)
+	}
+	// A checkbox left clear sends nothing, so these are read from whether they came.
+	if was := r.PostFormValue("was_stereo"); was != "" && speaker.Get().CanStereo() {
+		if on := r.PostFormValue("stereo") == "yes"; strconv.FormatBool(on) != was {
+			p.SetStereo(on)
+		}
+	}
+	if was := r.PostFormValue("was_top"); was != "" && p.LouderTopAvailable() {
+		if on := r.PostFormValue("top") == "yes"; strconv.FormatBool(on) != was {
+			p.SetLouderTop(on)
+		}
+	}
+	if was := r.PostFormValue("was_jack_sleep"); was != "" && p.JackSleepAvailable() {
+		if on := r.PostFormValue("jack_sleep") == "yes"; strconv.FormatBool(on) != was {
+			p.SetJackSleep(on)
+		}
+	}
+	if was := r.PostFormValue("was_louder"); was != "" {
+		if on := r.PostFormValue("louder") == "yes"; strconv.FormatBool(on) != was {
+			p.SetLouderSpeech(on)
+		}
+	}
+	if was := r.PostFormValue("was_dnd"); was != "" {
+		if on := r.PostFormValue("dnd") == "yes"; strconv.FormatBool(on) != was {
+			phone.Get().SetDoNotDisturb(on)
+		}
+	}
+	slog.Info("setup page: speaker and voice saved")
+	return ""
+}
+
+func gainLevel(r *http.Request, available bool) (n int, ok bool, problem string) {
+	v, ok := changed(r, "gain")
+	if !ok {
+		return 0, false, ""
+	}
+	if !available {
+		return 0, false, "speaker gain is not supported on this amplifier"
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n < 0 || n > config.SpeakerGainMax {
+		return 0, false, fmt.Sprintf("the speaker gain is a whole number from 0 to %d dB", config.SpeakerGainMax)
+	}
+	return n, true, ""
+}
+
+func oneOf(v string, list []string) bool {
+	for _, o := range list {
+		if o == v {
+			return true
+		}
+	}
+	return false
+}

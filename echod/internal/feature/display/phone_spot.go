@@ -1,0 +1,187 @@
+//go:build spot
+
+package display
+
+import (
+	"fmt"
+	"image"
+	"image/color"
+	"math"
+	"time"
+
+	"golang.org/x/image/font"
+
+	"github.com/HuskerMinion/techo5/echod/internal/feature/phone"
+	"github.com/HuskerMinion/techo5/echod/internal/hardware/touch"
+)
+
+// The call face: over everything while a call rings, is placed or is up. The rim pulses green; a tap
+// answers or hangs up (the same as anywhere else on the face, through the action), and a sideways
+// swipe declines a call that is ringing. The green is the Show's call green (answerGreen).
+
+// callGesture is a finger on the call face, and reports whether it was one.
+func (d *Display) callGesture(g touch.Gesture) bool {
+	st := phone.Get().State()
+	if st.Phase == phone.Idle {
+		return false
+	}
+	switch g.Kind {
+	case touch.Tap:
+		phone.Get().Button()
+	case touch.SwipeLeft, touch.SwipeRight:
+		if st.Phase == phone.Ringing {
+			phone.Get().Hangup()
+		}
+	default:
+		return false // volume swipes carry on as usual
+	}
+	d.wake()
+	return true
+}
+
+// callLights brings a dark panel up for a call that rings: the face is how it is answered.
+func (d *Display) callLights(st phone.State) {
+	if st.Phase == phone.Ringing {
+		d.mu.Lock()
+		on := d.on
+		d.mu.Unlock()
+		if !on {
+			d.apply(true, d.ceilingOrDefault(), false)
+		}
+	}
+	d.wake()
+}
+
+func (r *roundRenderer) callFace(s roundScene) {
+	st := s.call
+	pulse := 0.45 + 0.55*math.Abs(math.Sin(float64(s.now.UnixMilli())/400))
+	if st.Phase == phone.Talking {
+		pulse = 1
+	}
+	r.arc(rimIn, rimOut, 0, 2*math.Pi, fade(answerGreen, pulse))
+
+	title := upper(tr("ui_calling_variant"))
+	switch st.Phase {
+	case phone.Ringing:
+		title = upper(tr("ui_incoming_call"))
+	case phone.Talking:
+		title = upper(tr("ui_on_a_call"))
+	}
+	if st.DropIn {
+		title = upper(tr("ui_drop_in"))
+	}
+	r.centered(r.label, title, 150, answerGreen)
+	if s.atDoor { // the doorbell, pressed during the call: said here instead of rung (feature/doorbell)
+		r.centered(r.small, tr("ui_someone_s_at_the_door"), 192, colText)
+	}
+
+	who := st.Peer
+	if who == "" {
+		who = tr("ui_unknown")
+	}
+	face := r.small
+	for _, f := range []font.Face{r.title, r.body} {
+		if r.width(f, who) <= 360 {
+			face = f
+			break
+		}
+	}
+	r.centered(face, who, 240, colText)
+
+	switch st.Phase {
+	case phone.Talking:
+		d := s.now.Sub(st.Since).Round(time.Second)
+		r.centered(r.body, fmt.Sprintf("%d:%02d", int(d.Minutes()), int(d.Seconds())%60), 290, colDim)
+		r.centered(r.small, tr("ui_tap_to_hang_up"), 370, colDim)
+	case phone.Ringing:
+		r.centered(r.small, tr("ui_tap_to_answer"), 350, colText)
+		r.centered(r.small, tr("ui_swipe_to_decline"), 385, colDim)
+	default:
+		r.centered(r.small, tr("ui_tap_to_hang_up"), 370, colDim)
+	}
+}
+
+// The contact list: big rows, five at a time, so a finger lands on the one it means. A swipe up or down
+// scrolls, and arrows above and below say there is more.
+const (
+	contactRows   = 5
+	contactRowH   = 58
+	contactFirstY = 158 // the first visible row's baseline
+)
+
+// contactRowAt is which contact a tap at y is on, with top the first one shown, or -1.
+func contactRowAt(y, top, n int) int {
+	i := (y - (contactFirstY - 38)) / contactRowH
+	if y < contactFirstY-38 || i < 0 || i >= contactRows || top+i >= n {
+		return -1
+	}
+	return top + i
+}
+
+// callButtonAt is the face's Call button: a small green one at the top of the circle, above the
+// status words, where the lines under the clock that come and go cannot reach it.
+var callButtonAt = struct{ x, y, r int }{center, 70, 30}
+
+// onCallButton is whether a tap at x, y is on it, with a little room around it for a finger.
+func onCallButton(x, y int) bool {
+	dx, dy := x-callButtonAt.x, y-callButtonAt.y
+	reach := callButtonAt.r + 14
+	return dx*dx+dy*dy <= reach*reach
+}
+
+func (r *roundRenderer) callButtonFace() {
+	b := callButtonAt
+	box := image.Rect(b.x-b.r, b.y-b.r, b.x+b.r, b.y+b.r)
+	rad := float64(b.r)
+	r.roundShadow(box, rad, 8, 2, shadowAlpha())
+	on := r.press.on && onCallButton(r.press.at.X, r.press.at.Y)
+	r.roundFill(box, rad, r.pressTinted(on, shift(answerGreen, 10), colText), r.pressTinted(on, shift(answerGreen, -20), colText))
+	r.mdiIcon("phone", b.x-17, b.y-17, 34, colText)
+}
+
+// contactTopFor keeps a scroll position inside the list.
+func contactTopFor(top, n int) int { return min(max(top, 0), max(n-contactRows, 0)) }
+
+// contactList is who the Call item offers, the devices in the house and then the contacts: a tap
+// calls them.
+func (r *roundRenderer) contactList(s roundScene) {
+	r.clear()
+	r.centered(r.label, upper(tr("drawer_call")), 84, answerGreen)
+	if len(s.contacts) == 0 {
+		msg := tr("ui_no_contacts_yet")
+		switch {
+		case !s.phoneReady && !s.houseReady:
+			msg = tr("ui_set_house_word_to_call_other_devices")
+		case !s.phoneReady:
+			msg = tr("drawer_no_peers")
+		}
+		r.paragraph(r.body, msg, 230, colDim, 4)
+		return
+	}
+	top := contactTopFor(s.contactTop, len(s.contacts))
+	for i := 0; i < contactRows && top+i < len(s.contacts); i++ {
+		y := contactFirstY + i*contactRowH
+		w := 330
+		if i == 0 || i == contactRows-1 {
+			w = 280 // the circle is narrower at the top and bottom rows
+		}
+		c := s.contacts[top+i]
+		bar := color.RGBA{28, 34, 42, 255}
+		if c.Device {
+			bar = color.RGBA{24, 48, 36, 255} // a device in the house: a green cast, where a contact is gray
+		}
+		// The row a tap at the finger calls (contactRowAt), as the list is drawn.
+		bar = r.pressTinted(r.press.on && contactRowAt(r.press.at.Y, top, len(s.contacts)) == top+i, bar, colText)
+		r.line(float64(center-w/2), float64(y-12), float64(center+w/2), float64(y-12), float64(contactRowH-10), bar)
+		r.centered(r.title, clip(r.title, r, c.Name, w-30), y, colText)
+	}
+	if top > 0 {
+		r.triangle(center-16, 112, center+16, 112, center, 96, answerGreen)
+	}
+	if top+contactRows < len(s.contacts) {
+		r.triangle(center-16, 438, center+16, 438, center, 454, answerGreen)
+	}
+	if len(s.contacts) > contactRows {
+		r.centered(r.tiny, tr("ui_swipe_for_more"), 426, colDim)
+	}
+}

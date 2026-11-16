@@ -1,0 +1,536 @@
+//go:build !dot && !spot
+
+package display
+
+import (
+	"image"
+	"image/color"
+	"image/draw"
+	"log/slog"
+	"time"
+
+	"github.com/HuskerMinion/techo5/echod/internal/config"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/announce"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/dashboard"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/home"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/notify"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/remind"
+	"github.com/HuskerMinion/techo5/echod/internal/feature/video"
+	"github.com/HuskerMinion/techo5/echod/internal/hardware/touch"
+)
+
+// The dashboard page: a Home Assistant dashboard over the whole screen, drawn here or streamed from a
+// dashcast server. A swipe in from the left edge brings it up from the clock, and the same swipe takes
+// it away again; "go home" does too. The screen's own edges keep working on it: down from the top is
+// the settings, in from the right the drawer, so a dashboard that is the home page does not lock
+// anybody out of the rest.
+const (
+	// dashAway is how long the clock stays up when the dashboard is the idle page and somebody put
+	// it away.
+	dashAway = 2 * time.Minute
+)
+
+// Where a finger on a streamed dashboard started, when that was one of the screen's own edges.
+const (
+	edgeNone = iota
+	edgeLeft
+	edgeTop
+	edgeRight
+)
+
+// dashForgotten is whether a dashboard opened by hand and last touched at touched has been left long
+// enough for the clock to come back: the Dashboard returns setting, ten minutes unless somebody chose.
+// Not when it is also the idle page, which dashAway looks after.
+func dashForgotten(touched time.Time) bool {
+	after, ok := config.Get().Dashboard.Return()
+	return ok && time.Since(touched) > after
+}
+
+// openDashboard puts the dashboard up, if there is one to put up.
+func (d *Display) openDashboard() bool {
+	if dashboard.Get().Mode() == config.DashboardOff {
+		return false
+	}
+	d.mu.Lock()
+	d.dash, d.dashHeld, d.dashTouched, d.dashNight = true, false, time.Now(), false
+	d.drawer, d.sheet, d.deckUp = false, false, false
+	// A custom screen opened by hand gives way too: the dashboard, asked for or opened, comes first.
+	d.customs.up = ""
+	d.mu.Unlock()
+	slog.Info("dashboard up", "mode", dashboard.Get().Mode())
+	d.wake()
+	return true
+}
+
+// openNightDashboard is openDashboard from a tap on the night screen: the dashboard then shows over the
+// night clock until it goes (dashNight).
+func (d *Display) openNightDashboard() bool {
+	if !d.openDashboard() {
+		return false
+	}
+	d.mu.Lock()
+	d.dashNight = true
+	d.mu.Unlock()
+	return true
+}
+
+// overNight is whether something is up over the night screen (a camera, an announcement, a reminder,
+// a notification, a page Home Assistant asked for), which a tap there is for rather than for the
+// dashboard.
+func (d *Display) overNight() bool {
+	d.mu.Lock()
+	asked := d.askedUp(time.Now())
+	d.mu.Unlock()
+	if asked {
+		return true
+	}
+	if _, up := home.Get().Camera(); up {
+		return true
+	}
+	if _, up := notify.Get().Showing(); up {
+		return true
+	}
+	if _, up := announce.Get().Showing(); up {
+		return true
+	}
+	_, up := remind.Get().Showing()
+	return up
+}
+
+// closeDashboard takes the dashboard down: back to the clock, and when the dashboard is the idle page,
+// the clock for a while.
+func (d *Display) closeDashboard() {
+	d.mu.Lock()
+	d.dash, d.dashEdge, d.dashNight = false, edgeNone, false
+	if dashboard.Get().Idle() {
+		d.dashAwayUntil = time.Now().Add(dashAway)
+	}
+	d.mu.Unlock()
+	d.wake()
+}
+
+// dashboardAsked is Home Assistant's dashboard_show and dashboard_hide. Shown, it stays until it is
+// hidden or put away by hand, rather than the ten minutes one opened by a finger stays. Whatever else
+// has the screen - the settings, the drawer, a camera - keeps it until it is done, the dashboard
+// waiting behind it.
+func (d *Display) dashboardAsked(up bool) {
+	d.mu.Lock()
+	if up {
+		d.dash, d.dashHeld, d.dashTouched, d.dashAwayUntil, d.dashNight = true, true, time.Now(), time.Time{}, false
+		d.deckUp = false
+		d.mu.Unlock()
+		d.wake()
+		return
+	}
+	showing := d.dash || d.dashShowing
+	d.mu.Unlock()
+	if showing {
+		d.closeDashboard()
+	}
+}
+
+// dashScene decides whether the dashboard is the page, and fetches what it shows. Everything else
+// that takes the screen - a sheet, a camera, the weather, a turn - comes first; music comes first only
+// when the dashboard is standing in for the clock rather than asked for. The drawer does not: it slides
+// in over the page that is up, the dashboard as much as the clock, and takes every finger while it is in.
+func (d *Display) dashScene(s *scene, sheetOrDrawer bool) {
+	f := dashboard.Get()
+	mode := f.Mode()
+	d.mu.Lock()
+	if d.dash && !d.dashHeld && dashForgotten(d.dashTouched) {
+		d.dash = false
+	}
+	if !d.dash {
+		d.dashNight = false
+	}
+	asked, overNight := d.dash, d.dash && d.dashNight
+	// Under the red night clock a dashboard is not seen: one not opened from the night screen is put
+	// by rather than fetched and redrawn all night for nobody.
+	hidden := s.redClock && !overNight
+	away := time.Now().Before(d.dashAwayUntil)
+	d.mu.Unlock()
+
+	want := mode != config.DashboardOff && s.phase == "idle" && !sheetOrDrawer && !hidden &&
+		!s.showCamera && !s.showWeather && !s.showRadar && !s.showCalendar && !s.showDeck && s.custom.name == "" && !s.showWifi && !s.bt.Pairing &&
+		(asked || (f.Idle() && !away && !s.nowPlaying))
+	s.showDash, s.dashMode, s.dashAsked = want, mode, want && overNight
+	s.dashHide = config.Get().Dashboard.HideHandle
+
+	streamed := want && mode == config.DashboardStreamed
+	if streamed && d.r != nil {
+		s.dash = f.Stream(d.r.w, d.r.h)
+	}
+	d.dashKeyboardScene(s, streamed && d.r != nil)
+	if want && mode == config.DashboardTessera {
+		d.tessScene(s)
+		d.tessSheetViews(s)
+	}
+	if want && mode == config.DashboardDrawn {
+		s.drawn = f.Drawn(d.r.w)
+		s.dashTiles = config.Get().Dashboard.Tiles
+		s.dashLayout = config.Get().Dashboard.Layout
+		d.mu.Lock()
+		// A different dashboard starts at its top, and none is scrolled past its end: a short one
+		// chosen after a long one scrolled down would otherwise be all above the screen.
+		if path := config.Get().Dashboard.Path; path != d.dashScrollFor {
+			d.dashScroll, d.dashScrollFor = 0, path
+		}
+		if _, content := d.r.dash(); content > 0 {
+			d.dashScroll = min(d.dashScroll, max(content-d.r.h, 0))
+		}
+		s.dashScroll, s.dashAdjust, s.dashColor = d.dashScroll, d.dashAdjust, d.dashColor
+		d.mu.Unlock()
+		s.dashMedia = d.mediaViewNow()
+		s.dashClimate = d.climateViewNow()
+		s.dashFan = d.fanViewNow()
+		s.dashLibrary = d.libraryViewNow()
+	}
+
+	over := d.overDashboard(s)
+	d.mu.Lock()
+	d.dashShowing = want
+	// Either way the page wants every finger as it moves: streamed, to scroll the page under it;
+	// drawn, to scroll and to slide a tile's level. The rest of the screen wants swipes.
+	// Not while the keyboard is over the streamed page: a key pressed with a finger that slid a little
+	// is still a tap on it.
+	follow := want && !d.dashKbd.up && !s.showDrawer
+	changed := follow != d.dashFollow
+	d.dashFollow = follow
+	// Drawn, a finger held still on a light is a long press for its colors (color_sheet.go), which
+	// needs holds reported; the color sheet goes with the page. Not while something that takes only a
+	// tap is drawn over the page (overDashboard): with holds on, a slow press on it would be a hold
+	// and a release, which it does not answer, and which the page under it would.
+	// The Tessera page's long press opens the same sheets.
+	sheeted := want && (mode == config.DashboardDrawn || mode == config.DashboardTessera)
+	holds := sheeted && !over && !s.showDrawer
+	holdsChanged := holds != d.dashHolds
+	d.dashHolds = holds
+	if !sheeted {
+		d.dashColor, d.dashMedia, d.dashClimate, d.dashFan, d.dashLibrary = nil, nil, nil, nil, nil
+	}
+	d.mu.Unlock()
+	if changed {
+		touch.Get().SetFollow(follow)
+	}
+	if holdsChanged {
+		d.applyHolds()
+	}
+}
+
+// overDashboard is whether something that acts on a tap alone is drawn over the dashboard: a
+// reminder's or a notification's card, an event's pop-up, the PIN pad, the setup page's Allow and Deny, an announcement
+// arriving or being recorded, a DLNA video asking to be shown, or the video page.
+func (d *Display) overDashboard(s *scene) bool {
+	_, announcing := announce.Get().Showing()
+	_, reminding := remind.Get().Showing()
+	_, notifying := notify.Get().Card()
+	_, _, _, videoAsking := video.Get().Asking()
+	// The video's own state, not videoUp: that is what the last frame drew, and videoScene runs after
+	// this one, so the first frame of a video would still hold. The alert page is drawn in the
+	// dashboard's place (alertScene runs before this).
+	return s.pin.open || asksAtDevice() || announce.Get().Recording() || announcing || reminding || notifying ||
+		d.popupUp() != nil || videoAsking || d.videoUp() || video.Get().State().Active() || s.showAlert
+}
+
+// applyHolds tells the touchscreen whether to report a finger held still: for the night light's way up
+// (gesture) or the drawn dashboard's long press. What is wanted is read and set in one step under
+// holdsMu, so of two changes at once the later one is what the touchscreen is left with.
+func (d *Display) applyHolds() {
+	d.holdsMu.Lock()
+	defer d.holdsMu.Unlock()
+	d.mu.Lock()
+	holds := d.holdsWanted()
+	d.mu.Unlock()
+	touch.Get().SetHolds(holds)
+}
+
+// holdsWanted is whether a finger held still is to be reported: for the night light, and for the
+// drawn dashboard only while the panel is lit. Dark, the dashboard's own wish is left over from before
+// (dashScene does not run while the panel is off), and the dark panel wakes on a tap: with holds on, a
+// slow press there - a half-asleep hand on a night alarm - would be a hold and a release, and nothing.
+// While an announcement is recorded too: its strip says a hold cancels, and without holds reported a
+// long press there lifted as a tap, which sent what was meant to be thrown away.
+// Called with mu held.
+func (d *Display) holdsWanted() bool {
+	return d.nightGlow || ((d.dashHolds || d.clockHolds || d.recordHolds) && d.on)
+}
+
+// dashGesture is a finger on the dashboard. It goes to the page as it moves, except a finger that
+// starts at one of the screen's edges: the left takes the dashboard away, the top brings the
+// settings down, the right the drawer in. Streamed, the page is the browser's; drawn, a finger
+// moving up or down scrolls it and one moving along a tile with a level slides the level.
+func (d *Display) dashGesture(g touch.Gesture) {
+	if d.r == nil {
+		return
+	}
+	d.mu.Lock()
+	d.dashTouched = time.Now()
+	d.mu.Unlock()
+	edge := d.r.drawerEdge()
+	f := dashboard.Get()
+	streamed := f.Mode() == config.DashboardStreamed
+	tess := f.Mode() == config.DashboardTessera
+	// While the keyboard is over the streamed page, only its taps count: a finger moving on it is not
+	// the page's, which is under the keyboard. Swipes from the edges wait too, as over the device's other
+	// keyboards: Done or Cancel, or the keyboard left alone (dashKeyboardIdle), lets go of the screen.
+	keys := streamed && d.dashKeyboardUp()
+
+	switch g.Kind {
+	case touch.Tap:
+		switch {
+		case keys:
+			d.dashKey(d.r.keyAt(g.X, g.Y, d.dashKeyboardSymbols()))
+		case d.handleTapped(g.X, g.Y, streamed) && !d.colorOpen() && !d.libraryUp():
+			d.closeDashboard()
+		case streamed:
+			f.Touch("tap", g.X, g.Y)
+		case tess:
+			d.tessTap(g.X, g.Y)
+		default:
+			d.drawnTap(g.X, g.Y)
+		}
+	case touch.Hold:
+		from := edgeNone
+		// On the dashboard the edges are the strips beside the page, not the clock's wider bands, and
+		// a finger that lands on a tile is the tile's even there: sliding a light on the right-hand
+		// side is not opening the drawer.
+		edge = min(edge, d.r.margin)
+		// The music library's page reaches nearly to the edges, and a key or a picture there is its.
+		onTile := !streamed && (d.tileAt(g.X, g.Y) != nil || d.libraryUp())
+		// Right at a side edge the finger is pulling the page even over a tile that reaches there (a
+		// tile laid out to fill the panel does): the strip beside the tiles was otherwise 2.5 mm of a
+		// Show 5, and none of a full page. Not under a sheet, whose page is not going anywhere.
+		bezel := d.r.s(dashBezel)
+		sheetUp := d.colorOpen() || d.libraryUp()
+		switch {
+		case !keys && !sheetUp && g.X < bezel:
+			from = edgeLeft
+		case !keys && !sheetUp && g.X >= d.r.w-bezel:
+			from = edgeRight
+		case onTile || sheetUp:
+		case g.X < edge:
+			from = edgeLeft
+		case g.X >= d.r.w-edge:
+			from = edgeRight
+		case g.Y < topEdge/3:
+			// A thinner band than the clock's: the top of a dashboard is where its own tabs are.
+			from = edgeTop
+		}
+		d.mu.Lock()
+		d.dashEdge, d.dashEdgeAt = from, image.Pt(g.X, g.Y)
+		d.dashDrag = drawnDrag{startScroll: d.dashScroll}
+		d.mu.Unlock()
+		if from == edgeNone {
+			switch {
+			case keys:
+			case streamed:
+				f.Touch("down", g.X, g.Y)
+			case tess:
+				d.tessHold(g.X, g.Y)
+			default:
+				d.drawnHold(g.X, g.Y)
+			}
+			// A finger that stayed put until it was a hold, rather than one followed because it moved:
+			// a long press, which opens the tile's sheet now and not when it lifts.
+			if !keys && !streamed && !g.Moved {
+				d.tileHeld()
+			}
+		}
+	case touch.Drag:
+		d.mu.Lock()
+		from := d.dashEdge
+		d.mu.Unlock()
+		if from != edgeNone {
+			return
+		}
+		switch {
+		case keys:
+		case streamed:
+			f.Touch("move", g.X, g.Y)
+		case tess:
+			d.tessMove(g.X, g.Y)
+		default:
+			d.drawnMove(g.X, g.Y)
+		}
+	case touch.Release:
+		d.mu.Lock()
+		from, start := d.dashEdge, d.dashEdgeAt
+		d.dashEdge = edgeNone
+		d.mu.Unlock()
+		far := d.r.s(80)
+		switch from {
+		case edgeNone:
+			switch {
+			case keys:
+			case streamed:
+				f.Touch("up", g.X, g.Y)
+			case tess:
+				d.tessRelease(g.X, g.Y)
+			default:
+				d.drawnRelease(g.X, g.Y)
+			}
+		case edgeLeft:
+			if g.X-start.X > far {
+				d.closeDashboard()
+			}
+		case edgeRight:
+			if start.X-g.X > far {
+				d.openDrawerOver()
+			}
+		case edgeTop:
+			if g.Y-start.Y > far {
+				d.showSheet(true)
+			}
+		}
+	}
+}
+
+// tileHeld is a finger that has stayed put on the dashboard's page until it is a long press (the
+// touchscreen's Hold that did not come of moving): the tile under it opens its sheet now, while the
+// finger is still down, and the lift that follows does nothing. It used to open when the finger
+// lifted, so a press held to see more showed nothing until it was given up. Not with a sheet already
+// up: a press there acts where it lifts, as it did.
+func (d *Display) tileHeld() {
+	if d.colorOpen() {
+		return
+	}
+	d.mu.Lock()
+	dr := &d.dashDrag
+	t := dr.tile
+	held := dr.down && !dr.moved && !dr.sliding && !dr.scrolling && t != nil
+	dr.held = held
+	d.mu.Unlock()
+	if !held {
+		return
+	}
+	d.pressClear() // what it was pressing has answered
+	if t.tess > 0 {
+		d.tessSheet(t.entity)
+	} else {
+		d.longPress(t)
+	}
+	d.wake()
+}
+
+// openDrawerOver brings the drawer in over the dashboard, on the tab it was last on.
+func (d *Display) openDrawerOver() {
+	d.mu.Lock()
+	tab := d.drawerTab
+	d.mu.Unlock()
+	d.openDrawer(tab)
+}
+
+// The dashboard's handle: a short bar at the middle of the left edge, which is where a finger pulls the
+// page away to the right, and is itself a way back to the clock when tapped. Without it nothing on a
+// dashboard said how to leave it, and a panel with no microphone cannot be told to.
+const (
+	dashHandleLong = 72 // its length
+	dashHandleWide = 6
+	dashHandleIn   = 5  // from the panel's edge
+	dashHandleTap  = 20 // how far in from the edge a tap is the handle's: the margin beside the tiles
+	dashBezel      = 12 // a finger that comes down this near a side edge is pulling the page, tile or not
+)
+
+// dashHandle draws the handle, light on a dark rim so it shows on any page, a streamed one included. At
+// night (s.nightDim) its light is the night's own red, as the rest of what is drawn is toned, so that it
+// is not the brightest thing on a dark bedside screen; off, it is not drawn at all (#564).
+func (r *renderer) dashHandle(s scene) {
+	if s.dashHide {
+		return
+	}
+	x, y, half := r.s(dashHandleIn), r.h/2, r.s(dashHandleLong)/2
+	bar := image.Rect(x, y-half, x+r.s(dashHandleWide), y+half)
+	rim := color.RGBA{0x10, 0x10, 0x10, 0xff}
+	ink := color.RGBA{0xb4, 0xb0, 0xaa, 0xff}
+	if s.nightDim {
+		ink = nightTone(ink)
+	}
+	r.roundFill(bar.Inset(-r.s(2)), float64(bar.Dx()+2*r.s(2))/2, rim, rim)
+	r.roundFill(bar, float64(bar.Dx())/2, ink, ink)
+}
+
+// dashSheetUp is whether one of the dashboard's sheets, or the music library, is over its page: the
+// page is not going anywhere under one, and the handle is not drawn.
+func (s *scene) dashSheetUp() bool {
+	return s.dashColor != nil || s.dashMedia != nil || s.dashClimate != nil || s.dashFan != nil || s.dashLibrary != nil
+}
+
+// dashHandleAt is whether x, y is on the handle: the edge strip beside it, taller than the bar.
+func (r *renderer) dashHandleAt(x, y int) bool {
+	return x < r.s(dashHandleTap) && abs(y-r.h/2) <= r.s(dashHandleLong)
+}
+
+// handleTapped is whether a tap at x, y is the handle's, which closes the dashboard. Not where the page
+// has something of its own to tap: a tile or a picture reaching the edge (a lone tile's page is all
+// tile), whose press shows and must not close the page instead; on a streamed page, Home Assistant's
+// own sidebar is there, so only the outer half of the strip is the handle's.
+func (d *Display) handleTapped(x, y int, streamed bool) bool {
+	if config.Get().Dashboard.HideHandle || !d.r.dashHandleAt(x, y) {
+		return false // no handle, no tap that is its: the edge is the page's, and the swipe still takes it away
+	}
+	if streamed {
+		return x < d.r.s(dashHandleTap)/2
+	}
+	return d.tileAt(x, y) == nil
+}
+
+// drawnDashboard is the drawn dashboard over the whole panel.
+func (r *renderer) drawnDashboard(s scene) {
+	r.dashPage(s.drawn, s.dashScroll, s.dashAdjust, r.dst.Rect, s.dashTiles, s.dashLayout)
+	if !s.dashSheetUp() {
+		r.pressTile(r.palette(s.drawn.Theme)) // under a sheet a finger is on the sheet
+		r.dashHandle(s)
+	}
+	r.colorSheet(s.dashColor, s.drawn.Theme)
+	r.mediaSheet(s.dashMedia, s.drawn.Theme)
+	r.climateSheet(s.dashClimate, s.drawn.Theme)
+	r.fanSheet(s.dashFan, s.drawn.Theme)
+	r.librarySheet(s.dashLibrary, s.drawn.Theme)
+}
+
+// dashboardPage draws the dashboard over the whole panel.
+func (r *renderer) dashboardPage(s scene) {
+	switch s.dashMode {
+	case config.DashboardDrawn:
+		r.drawnDashboard(s)
+		return
+	case config.DashboardTessera:
+		r.tesseraPage(s.tessera, s.tessOn, s.tessPage, s.dashAdjust, s.now)
+		if !s.dashSheetUp() {
+			r.pressTile(r.palette(dashboard.Theme{}))
+			r.dashHandle(s)
+		}
+		r.colorSheet(s.dashColor, dashboard.Theme{})
+		r.mediaSheet(s.dashMedia, dashboard.Theme{})
+		r.climateSheet(s.dashClimate, dashboard.Theme{})
+		r.fanSheet(s.dashFan, dashboard.Theme{})
+		r.librarySheet(s.dashLibrary, dashboard.Theme{})
+		return
+	}
+	if s.dashKbd.up {
+		r.dashKeyboardPage(s.dashKbd)
+		return
+	}
+	v := s.dash
+	drawn := v.Ready && drawStream(r.dst)
+	msg := v.Problem
+	if msg == "" && !drawn {
+		msg = tr("connecting_to_the_dashboard")
+	}
+	r.dashHandle(s)
+	if msg != "" && !drawn {
+		r.text(r.small, msg, (r.w-r.width(r.small, msg))/2, r.h/2, dim)
+		return
+	}
+	foot := r.h
+	if msg != "" {
+		// Over the picture: the last one stays up, with what went wrong along the foot.
+		foot = r.h - r.s(36)
+		draw.Draw(r.dst, image.Rect(0, foot, r.w, r.h), image.NewUniform(shade), image.Point{}, draw.Over)
+		r.text(r.tiny, msg, r.margin, r.h-r.s(11), dim)
+	}
+	if drawn && dashStale(v, s.now) {
+		// In the corner at the foot, over that line: a page's own header is along its top.
+		r.staleChip(image.Pt(r.w-r.margin, foot-r.s(12)), true) // its shadow clear of the line too
+	}
+}

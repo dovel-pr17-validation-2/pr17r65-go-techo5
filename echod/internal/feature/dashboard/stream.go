@@ -1,0 +1,537 @@
+//go:build !dot
+
+package dashboard
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"image"
+	"image/draw"
+	"image/jpeg"
+	"io"
+	"log/slog"
+	"net"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	"github.com/HuskerMinion/techo5/echod/internal/config"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/fastjpeg"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/redact"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/safe"
+)
+
+// The dashcast protocol, as dashcast/serve.go describes it, inside the encrypted connection secure.go
+// makes: a hello line of JSON, then a JSON line per touch or per key typed; back come length-framed
+// messages, a picture to draw at a place, a problem to show, or a text field on the page that got or
+// lost focus.
+const (
+	kindPicture  = 1
+	kindProblem  = 2
+	kindHalf     = 3 // a picture at half size, drawn doubled: sent while most of the page is moving
+	kindPages    = 4 // the web pages' names, the answer to a hello asking for them (Pages)
+	kindKeyboard = 5 // a text field on the page got focus or lost it (Field)
+	kindAlive    = 6 // nothing to draw: the server is still there (aliveWithin)
+)
+
+// aliveWithin is how long a server that says it is there (kindAlive) may then say nothing at all
+// before its connection is taken for lost and another is made, as after one that dropped.
+//
+// A page that does not change sends no pictures, for hours, so silence alone means nothing; and a
+// connection that died with its socket open looked the same, the last picture left up and taking taps
+// that went nowhere. A server that sends kindAlive sends it every few seconds, so three of them missed
+// is a connection gone. One from before it knew kindAlive never sends it, and is waited on as it always
+// was. A variable for the tests.
+var aliveWithin = 15 * time.Second
+
+// Field is the text field on the streamed page that has focus, for the screen's own keyboard (#493):
+// the page is a picture here, so the dashcast server says when a field is tapped. Up while one has
+// focus, with its kind (text, search, password, number…), the text already in it (never a
+// password's) and its label.
+type Field struct {
+	Up    bool   `json:"up"`
+	Kind  string `json:"kind"`
+	Value string `json:"value"`
+	Label string `json:"label"`
+	// Seq counts what servers have said, so a field tapped again is told from the one before.
+	Seq uint64 `json:"-"`
+}
+
+// fieldMax bounds the text and label taken from the server, in characters.
+const fieldMax = 500
+
+// webPath starts the path of one of the dashcast server's own web pages, by its name ("web:Status"):
+// a page the server's owner listed, which the device asks for by name and never by address.
+const webPath = "web:"
+
+// WebPage is the name of the dashcast web page path is, if it is one.
+func WebPage(path string) (string, bool) { return strings.CutPrefix(path, webPath) }
+
+// View is what the page knows about the stream: whether there is a picture to draw (DrawStream
+// draws it), and if not, or not any more, why.
+type View struct {
+	Ready   bool   // a picture has arrived
+	Problem string // a sentence for the screen, empty when all is well
+	Version uint64 // counts pictures, so a drawer can tell a new one from the last
+	Field   Field  // the page's text field with focus, if one has it
+	// Lost is when the connection went with a picture still up: what is drawn since is the last one
+	// that came, and nothing on it answers a touch. Zero while a connection is feeding the picture.
+	Lost time.Time
+}
+
+// stream is one connection's worth of dashboard, kept going while the page is up.
+type stream struct {
+	f    *Feature
+	w, h int
+
+	mu      sync.Mutex
+	conn    net.Conn
+	view    View
+	frame   *image.RGBA // painted in place as pictures arrive, under mu
+	stopped bool
+	enc     *json.Encoder
+}
+
+// DrawStream draws the streamed dashboard into dst, and reports whether there was one to draw.
+func (f *Feature) DrawStream(dst *image.RGBA) bool {
+	f.mu.Lock()
+	s := f.stream
+	f.mu.Unlock()
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.frame == nil || !s.view.Ready {
+		return false
+	}
+	draw.Draw(dst, dst.Rect, s.frame, image.Point{}, draw.Src)
+	return true
+}
+
+// Stream is the streamed dashboard at w by h, connecting if it is not already. It is for the page
+// that is up; Close ends it when the page goes.
+func (f *Feature) Stream(w, h int) View {
+	f.mu.Lock()
+	s := f.stream
+	if s == nil || s.w != w || s.h != h {
+		if s != nil {
+			safe.Go("dashboard stream close", s.close)
+		}
+		s = &stream{f: f, w: w, h: h}
+		f.stream = s
+		safe.Go("dashboard stream", s.run)
+	}
+	f.streamUsed = time.Now()
+	f.mu.Unlock()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.view
+}
+
+// Close ends the stream, if there is one.
+func (f *Feature) Close() {
+	f.mu.Lock()
+	s := f.stream
+	f.stream = nil
+	f.mu.Unlock()
+	if s != nil {
+		s.close()
+	}
+}
+
+// Touch passes a touch on to the streamed page: kind is tap, down, move or up.
+func (f *Feature) Touch(kind string, x, y int) {
+	f.send(map[string]any{"t": kind, "x": x, "y": y})
+}
+
+// Type types text into the streamed page's field with focus.
+func (f *Feature) Type(text string) {
+	if text != "" {
+		f.send(map[string]any{"t": "text", "s": text})
+	}
+}
+
+// Key presses a key in the streamed page's field with focus: Backspace or Enter, or "done", which
+// lets go of the field.
+func (f *Feature) Key(k string) {
+	f.send(map[string]any{"t": "key", "k": k})
+}
+
+// send writes a line to the server: a touch or a key.
+func (f *Feature) send(line map[string]any) {
+	f.mu.Lock()
+	s := f.stream
+	f.mu.Unlock()
+	if s == nil {
+		return
+	}
+	// Written by whoever touched, which is the touch reader, outside the lock the page draws under,
+	// and given a moment at most: a server that has stopped reading must not freeze the screen.
+	s.mu.Lock()
+	enc, c := s.enc, s.conn
+	s.mu.Unlock()
+	if enc == nil {
+		return
+	}
+	_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_ = enc.Encode(line)
+}
+
+// setField takes what the server said about the page's field: down when the connection goes, as the
+// page it was in is not this screen's any more.
+func (s *stream) setField(fl Field) {
+	s.mu.Lock()
+	if !fl.Up && !s.view.Field.Up {
+		s.mu.Unlock()
+		return
+	}
+	if !fl.Up {
+		fl = Field{}
+	}
+	fl.Value, fl.Label = cutRunes(fl.Value, fieldMax), cutRunes(fl.Label, fieldMax)
+	fl.Seq = s.f.fieldSeq.Add(1) // counted for the Feature: a new stream must not start the count over
+	s.view.Field = fl
+	s.mu.Unlock()
+	s.f.Changed.Emit(struct{}{})
+}
+
+// cutRunes is s in at most n characters, and valid UTF-8.
+func cutRunes(s string, n int) string {
+	s = strings.ToValidUTF8(s, "")
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	return string([]rune(s)[:n])
+}
+
+func (s *stream) close() {
+	s.mu.Lock()
+	s.stopped = true
+	c := s.conn
+	s.mu.Unlock()
+	if c != nil {
+		c.Close()
+	}
+}
+
+// serverProblem is the server's sentence for the screen, without the error it may end with: "The
+// dashboard would not open: " and then a browser's error, which can name the page's address with a
+// token in its query. The whole of it is logged, those parts of its addresses taken off.
+func serverProblem(text string) string {
+	text = cutRunes(text, 300)
+	head, _, found := strings.Cut(text, ": ")
+	if !found {
+		return text
+	}
+	slog.Warn("dashboard: the server's problem", "said", redact.URLSecrets(text))
+	return strings.TrimRight(head, ".") + "."
+}
+
+func (s *stream) problem(text string) {
+	s.mu.Lock()
+	s.view.Problem = text
+	s.mu.Unlock()
+	s.f.Changed.Emit(struct{}{})
+}
+
+// lost notes that the picture on the screen has no connection behind it any more, from the first
+// moment that was known. The next picture to arrive takes the note away (paint).
+func (s *stream) lost() {
+	s.mu.Lock()
+	first := s.view.Ready && s.view.Lost.IsZero()
+	if first {
+		s.view.Lost = time.Now()
+	}
+	s.mu.Unlock()
+	if first {
+		s.f.Changed.Emit(struct{}{})
+	}
+}
+
+// run connects and reconnects until closed, waiting longer each time it fails. A connection that
+// lasted is not a failure: the server ending a stuck session (#112) is answered within a second, not
+// after the longest wait of failures long past.
+func (s *stream) run() {
+	wait := time.Second
+	for {
+		s.mu.Lock()
+		stopped := s.stopped
+		s.mu.Unlock()
+		if stopped {
+			return
+		}
+		began := time.Now()
+		err := s.once()
+		if time.Since(began) > time.Minute {
+			wait = time.Second
+		}
+		s.mu.Lock()
+		stopped = s.stopped
+		s.mu.Unlock()
+		if stopped {
+			return
+		}
+		if err != nil {
+			slog.Info("dashboard stream", "err", err)
+		}
+		s.lost()
+		time.Sleep(wait)
+		wait = min(wait*2, 30*time.Second)
+	}
+}
+
+func (s *stream) once() error {
+	cfg := config.Get()
+	d := cfg.Dashboard
+	if d.Server == "" {
+		s.problem("Streaming needs a dashcast server: set one with the dashboard_server action.")
+		return errors.New("no server set")
+	}
+	raw, err := net.DialTimeout("tcp", d.Server, 5*time.Second)
+	if err != nil {
+		slog.Warn("dashboard: can't reach the server", "server", redact.URLSecrets(d.Server), "err", redact.URLSecrets(err.Error()))
+		s.problem("Can't reach the dashboard server.")
+		return err
+	}
+	defer raw.Close()
+	_ = raw.SetDeadline(time.Now().Add(10 * time.Second))
+	c, err := clientHandshake(raw, d.Key)
+	if err != nil {
+		s.problem("The dashboard server did not accept this device's key.")
+		return err
+	}
+	_ = raw.SetDeadline(time.Time{})
+
+	path := "/" + d.Path
+	if d.Path == "" {
+		path = "/lovelace/0"
+	}
+	enc := json.NewEncoder(c)
+	hello := map[string]any{"name": cfg.Device.Name, "w": s.w, "h": s.h, "path": path}
+	if page, ok := WebPage(d.Path); ok {
+		// By name alone. A dashcast from before it knew web pages takes the path, which is no
+		// dashboard, and says so on the screen.
+		hello["page"] = page
+	} else if cfg.Dashboard.Kiosk {
+		hello["kiosk"] = true // a dashcast from before it knew kiosk ignores it and shows the header
+	}
+	if err := enc.Encode(hello); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return nil
+	}
+	s.conn, s.enc = c, enc
+	s.view.Problem = ""
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.conn, s.enc = nil, nil
+		s.mu.Unlock()
+		s.setField(Field{})
+	}()
+	slog.Info("dashboard stream connected", "server", d.Server, "path", path)
+
+	r := bufio.NewReaderSize(c, 256<<10)
+	var hdr [4]byte
+	alive := false // the server has said it sends kindAlive: its silence now means something
+	for {
+		if alive {
+			// Anything it sends counts, a picture as much as kindAlive. A read that runs out ends the
+			// connection as a drop does, and run makes another.
+			_ = raw.SetReadDeadline(time.Now().Add(aliveWithin))
+		}
+		if _, err := io.ReadFull(r, hdr[:]); err != nil {
+			return err
+		}
+		n := binary.BigEndian.Uint32(hdr[:])
+		if n == 0 || n > messageMax {
+			return errors.New("dashboard stream: a message of an impossible size")
+		}
+		msg := make([]byte, n)
+		if _, err := io.ReadFull(r, msg); err != nil {
+			return err
+		}
+		switch msg[0] {
+		case kindAlive:
+			alive = true
+		case kindHalf:
+			if len(msg) < 5 {
+				continue
+			}
+			at := image.Pt(int(binary.BigEndian.Uint16(msg[1:3])), int(binary.BigEndian.Uint16(msg[3:5])))
+			img, err := decodeWithin(msg[5:], s.w/2+1, s.h/2+1)
+			if err != nil {
+				continue
+			}
+			s.paintDoubled(at, img)
+		case kindProblem:
+			s.problem(serverProblem(string(msg[1:])))
+		case kindKeyboard:
+			var fl Field
+			if json.Unmarshal(msg[1:], &fl) == nil {
+				s.setField(fl)
+			}
+		case kindPicture:
+			if len(msg) < 5 {
+				continue
+			}
+			at := image.Pt(int(binary.BigEndian.Uint16(msg[1:3])), int(binary.BigEndian.Uint16(msg[3:5])))
+			img, err := decodeWithin(msg[5:], s.w, s.h)
+			if err != nil {
+				continue
+			}
+			s.paint(at, img)
+		}
+	}
+}
+
+// Check says whether the dashcast server at server answers and takes key, in words for the setup page,
+// and whether it does: the one thing a person setting it up can't see from the device, where a server
+// that isn't there and a key that doesn't match look the same, a screen that stays empty.
+func Check(server, key string) (string, bool) {
+	if server == "" {
+		return "No dashboard server is set.", false
+	}
+	raw, err := net.DialTimeout("tcp", server, 3*time.Second)
+	if err != nil {
+		return "Can't reach " + server + ": check the address and port, and that dashcast is running.", false
+	}
+	defer raw.Close()
+	_ = raw.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := clientHandshake(raw, key); err != nil {
+		return server + " answered but didn't take the key: give the device the same key as DASHCAST_KEY (or it isn't dashcast).", false
+	}
+	return "Connected: dashcast at " + server + " answered and took the key.", true
+}
+
+// messageMax is the largest message a server may send: a full-screen picture is well under 1 MB.
+const messageMax = 4 << 20
+
+// Pages asks the dashcast server at server for the web pages it lists, by name. A server from before
+// it had any closes the connection without an answer, which is no pages.
+func Pages(server, key, name string) ([]string, error) {
+	raw, err := net.DialTimeout("tcp", server, 5*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer raw.Close()
+	_ = raw.SetDeadline(time.Now().Add(10 * time.Second))
+	c, err := clientHandshake(raw, key)
+	if err != nil {
+		return nil, err
+	}
+	if err := json.NewEncoder(c).Encode(map[string]any{"name": name, "list": true}); err != nil {
+		return nil, err
+	}
+	var hdr [4]byte
+	if _, err := io.ReadFull(c, hdr[:]); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	n := binary.BigEndian.Uint32(hdr[:])
+	if n == 0 || n > pagesMax {
+		return nil, errors.New("dashboard server: a list of pages of an impossible size")
+	}
+	msg := make([]byte, n)
+	if _, err := io.ReadFull(c, msg); err != nil {
+		return nil, err
+	}
+	if msg[0] != kindPages {
+		return nil, nil
+	}
+	var names []string
+	if err := json.Unmarshal(msg[1:], &names); err != nil {
+		return nil, err
+	}
+	return names, nil
+}
+
+// pagesMax is the largest list of pages a server may send.
+const pagesMax = 64 << 10
+
+// decodeWithin decodes a JPEG no larger than w by h, looking at its size before decoding it: a server
+// that sends a picture claiming to be enormous gets nothing decoded, rather than all of memory.
+func decodeWithin(b []byte, w, h int) (image.Image, error) {
+	cfg, err := jpeg.DecodeConfig(bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 || cfg.Width > w || cfg.Height > h {
+		return nil, errors.New("dashboard stream: a picture larger than the screen")
+	}
+	return fastjpeg.Decode(b)
+}
+
+// paint puts a picture into the frame where it belongs. Pictures are painted as they arrive, however
+// fast, and the page draws whatever the frame holds when it next draws: nothing queues behind a slow
+// screen, and a picture the screen never showed on its own still shows in the next.
+func (s *stream) paint(at image.Point, img image.Image) {
+	b := img.Bounds()
+	s.mu.Lock()
+	if s.frame == nil {
+		s.frame = image.NewRGBA(image.Rect(0, 0, s.w, s.h))
+	}
+	draw.Draw(s.frame, image.Rectangle{Min: at, Max: at.Add(b.Size())}, img, b.Min, draw.Src)
+	s.view.Ready = true
+	s.view.Lost = time.Time{}
+	s.view.Version++
+	s.mu.Unlock()
+	s.f.Changed.Emit(struct{}{})
+}
+
+// paintDoubled puts a half-size picture into the frame at twice its size, each pixel as four. It is
+// soft, but it is a page moving, and the full-size one follows once it stops.
+func (s *stream) paintDoubled(at image.Point, img image.Image) {
+	b := img.Bounds()
+	// Colors worked out once per pixel of the small picture, outside the lock.
+	small := image.NewRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+	draw.Draw(small, small.Rect, img, b.Min, draw.Src)
+
+	if at.X < 0 || at.Y < 0 || at.X >= s.w || at.Y >= s.h {
+		return // off the screen: nothing of it would show
+	}
+	s.mu.Lock()
+	if s.frame == nil {
+		s.frame = image.NewRGBA(image.Rect(0, 0, s.w, s.h))
+	}
+	f := s.frame
+	for y := 0; y < small.Rect.Dy(); y++ {
+		ty := at.Y + 2*y
+		if ty+1 >= s.h {
+			break
+		}
+		src := small.Pix[y*small.Stride : y*small.Stride+small.Rect.Dx()*4]
+		r0 := f.Pix[ty*f.Stride : (ty+1)*f.Stride]
+		for x := 0; x*4 < len(src); x++ {
+			tx := at.X + 2*x
+			if tx+1 >= s.w {
+				break
+			}
+			p := src[x*4 : x*4+4]
+			o := tx * 4
+			copy(r0[o:o+4], p)
+			copy(r0[o+4:o+8], p)
+		}
+		// The row below is the row just drawn, over the same span, clipped to the frame.
+		lo, hi := at.X*4, min(at.X+2*small.Rect.Dx(), s.w)*4
+		if hi > lo {
+			copy(f.Pix[(ty+1)*f.Stride+lo:(ty+1)*f.Stride+hi], r0[lo:hi])
+		}
+	}
+	s.view.Ready = true
+	s.view.Lost = time.Time{}
+	s.view.Version++
+	s.mu.Unlock()
+	s.f.Changed.Emit(struct{}{})
+}

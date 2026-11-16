@@ -1,0 +1,551 @@
+// Package bluetooth forwards what the BLE radio hears to Home Assistant, so a device out of range
+// of everything else is in range of this one.
+package bluetooth
+
+import (
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"google.golang.org/protobuf/proto"
+
+	esphome "github.com/ygelfand/go-esphome-device"
+	"github.com/ygelfand/go-esphome-device/api"
+
+	"github.com/HuskerMinion/techo5/echod/internal/component"
+	"github.com/HuskerMinion/techo5/echod/internal/config"
+	"github.com/HuskerMinion/techo5/echod/internal/hardware/ble"
+	"github.com/HuskerMinion/techo5/echod/internal/layout"
+	"github.com/HuskerMinion/techo5/echod/internal/lib/safe"
+)
+
+func init() {
+	if !Here {
+		return
+	}
+	component.Register(component.Device, Get(), component.Order(40))
+}
+
+const (
+	// batch is how many reports go in one message, and hold how long to wait for them.
+	batch = 16
+	hold  = 250 * time.Millisecond
+
+	// queued is how many reports may wait for Home Assistant. Past this they are dropped: the radio
+	// must never wait on the network, or the controller's own queue overflows and the driver starts
+	// discarding packets for everything on the chip, wifi included.
+	queued = 512
+)
+
+// bluetoothFeatures is what the device advertises when the proxy is on, and connectingFeatures what
+// it adds when its connections switch is on too, where there is a GATT client to lend.
+const (
+	bluetoothFeatures = esphome.BluetoothPassiveScan |
+		esphome.BluetoothRawAdvertisements |
+		esphome.BluetoothStateAndMode
+	connectingFeatures = esphome.BluetoothActiveConnections | esphome.BluetoothRemoteCaching
+)
+
+type beaconState struct {
+	advertisement []byte
+	minor         int
+}
+
+// bluetooth carries what the radio hears to Home Assistant. The switch says whether the radio may
+// run at all, and the subscription whether anyone is reading.
+//
+// Separate goroutines read reports, deliver batches, and tune the radio. Handlers run on the
+// connection's goroutine, and HCI commands wait on the controller, so doing that work inline stops
+// the connection answering anything at all.
+type Proxy struct {
+	proxy  *esphome.BluetoothProxy
+	taken  takeover
+	radio  ble.Scanner
+	enable *esphome.Switch
+	// connect is the "Bluetooth proxy connections" switch: whether Home Assistant may connect to
+	// devices through the proxy. Only where there is a GATT client (openCentral).
+	connect *esphome.Switch
+	beacon  beaconState
+	links   *connections
+
+	wanted  chan struct{}
+	reports chan ble.Advertisement
+	dropped atomic.Uint64
+
+	// lost says the controller dropped the scan under a radio that still runs it (ble.PowerCycled).
+	lost atomic.Bool
+
+	mu     sync.Mutex
+	active bool
+	// held counts Holds: while any is out the radio is off, scanning and iBeacon both.
+	held int
+	// lent is the held radio out on Offer: tune leaves it alone until it comes back.
+	lent bool
+
+	// steer is held for the whole of a tune and of lending the radio out or taking it back, so a tune
+	// that began before the radio was lent cannot stop it once it is.
+	steer sync.Mutex
+}
+
+var (
+	once   sync.Once
+	shared *Proxy
+)
+
+func Get() *Proxy {
+	once.Do(func() { shared = build() })
+	return shared
+}
+
+func build() *Proxy {
+	mac, _ := layout.FactoryMAC()
+	minor := beaconMinor(mac)
+	if !proxyBeaconSupported {
+		minor = -1
+	}
+	b := &Proxy{
+		proxy:   &esphome.BluetoothProxy{},
+		radio:   ble.Default(),
+		beacon:  beaconState{advertisement: beaconAdvertisement(minor), minor: minor},
+		wanted:  make(chan struct{}, 1),
+		reports: make(chan ble.Advertisement, queued),
+		links:   newConnections(openCentral),
+		enable: &esphome.Switch{
+			Base: esphome.Base{
+				ObjectID: "bluetooth_proxy",
+				Name:     "Bluetooth proxy",
+				Icon:     "mdi:bluetooth",
+				Category: esphome.CategoryConfig,
+			},
+		},
+		connect: &esphome.Switch{
+			Base: esphome.Base{
+				ObjectID: "bluetooth_proxy_connections",
+				Name:     "Bluetooth proxy connections",
+				Icon:     "mdi:bluetooth-connect",
+				Category: esphome.CategoryConfig,
+			},
+		},
+	}
+
+	if p, ok := b.radio.(interface{ Pause() func() }); ok {
+		b.links.pause = p.Pause
+	}
+	b.links.allowed = b.ConnectionsEnabled
+	// Home Assistant stopping listening is usually its connection gone (the library notices on the
+	// next batch of advertisements), and the devices it connected have nobody to answer to.
+	b.proxy.OnSubscribed = func(on bool) {
+		b.showConnections()
+		b.apply()
+		if !on {
+			b.links.ReleaseGone()
+		}
+	}
+	b.proxy.OnMode = func(bool) { b.apply() }
+
+	b.enable.Set(config.Get().Bluetooth.Proxy)
+	proxyPermission(config.Get().Bluetooth.Proxy)
+	b.enable.OnCommand = func(on bool) {
+		b.enable.Set(on)
+		// Saved first: until it is, a connection asked for would still be let in, after the release.
+		if err := config.Set().Bluetooth().Proxy(on); err != nil {
+			slog.Error("saving the bluetooth proxy setting failed", "err", err)
+			return
+		}
+		if !on {
+			b.links.ReleaseAll()
+		}
+		proxyPermission(on)
+		b.apply()
+
+		// What the device advertises has changed, and that is only read when a client connects.
+		component.Reconnect.Emit(struct{}{})
+	}
+
+	// The switch shows what is lent, not only what was saved: connections saved on from before the key
+	// rule stay saved, so adding a key brings them back, but they read off until then.
+	// A key given later (adoption) comes with a new connection from Home Assistant, which is when the
+	// switch is shown again (OnSubscribed, and Reconnect).
+	saved := config.Get().Bluetooth.ProxyConnections
+	b.showConnections()
+	component.Reconnect.Listen(func(struct{}) { b.showConnections() })
+	if saved && !linkKeyed() {
+		slog.Warn("bluetooth proxy connections are on but off until the device has an API encryption key")
+	}
+	b.connect.OnCommand = func(on bool) {
+		if on && !linkKeyed() {
+			b.connect.Set(false)
+			slog.Warn("bluetooth proxy connections need an API encryption key first")
+			return
+		}
+		b.connect.Set(on)
+		// Saved first: until it is, a connection asked for would still be let in, after the release.
+		if err := config.Set().Bluetooth().ProxyConnections(on); err != nil {
+			slog.Error("saving the bluetooth proxy connections setting failed", "err", err)
+			return
+		}
+		if !on {
+			b.links.ReleaseAll()
+		}
+		component.Reconnect.Emit(struct{}{})
+	}
+
+	safe.Go("ble radio", b.settle)
+	safe.Go("ble reports", b.deliver)
+	if openCentral != nil {
+		safe.Go("ble links", b.links.watch)
+	}
+	safe.Go("ble rest", b.restWhilePlaying)
+	ble.ScanLost.Listen(func(struct{}) { b.apply() })
+	ble.PowerCycled.Listen(func(struct{}) {
+		b.lost.Store(true)
+		b.apply()
+	})
+	b.apply()
+	return b
+}
+
+func beaconMinor(mac string) int {
+	address, err := net.ParseMAC(mac)
+	if err != nil || len(address) != 6 {
+		return -1
+	}
+	return int(binary.BigEndian.Uint16(address[4:]))
+}
+
+func (b *Proxy) Name() string { return "bluetooth proxy" }
+
+func (b *Proxy) Entities() []esphome.Entity {
+	if openCentral == nil {
+		return []esphome.Entity{b.enable}
+	}
+	return []esphome.Entity{b.enable, b.connect}
+}
+
+// Handle answers the proxy's own protocol messages: subscribe, unsubscribe, set mode, and the
+// connections Home Assistant makes through it.
+func (b *Proxy) Handle(ctx context.Context, conn *esphome.Conn, msg proto.Message) error {
+	if handles(msg) {
+		return b.links.Handle(conn, msg)
+	}
+	switch msg.(type) {
+	case *api.SubscribeBluetoothLEAdvertisementsRequest:
+		b.taken.note(conn, true, b.freeNow)
+	case *api.UnsubscribeBluetoothLEAdvertisementsRequest:
+		b.taken.note(conn, false, nil)
+	}
+	return b.proxy.Handle(ctx, conn, msg)
+}
+
+// Enabled reports whether the user has asked for the proxy.
+// SetEnabled turns the proxy on or off as Home Assistant's switch would, for the screen.
+func (b *Proxy) SetEnabled(on bool) { b.enable.OnCommand(on) }
+
+func (b *Proxy) Enabled() bool { return Here && config.Get().Bluetooth.Proxy }
+
+// freeNow is the free-slots reply as it stands: the lent slots, or none where connections are not lent,
+// as refuse answers.
+func (b *Proxy) freeNow() proto.Message {
+	if b.ConnectionsEnabled() {
+		return b.links.free()
+	}
+	return &api.BluetoothConnectionsFreeResponse{}
+}
+
+// ConnectionsEnabled reports whether Home Assistant may connect to devices through the proxy: the proxy on,
+// its connections switch on, a GATT client to lend, and the Home Assistant link keyed.
+func (b *Proxy) ConnectionsEnabled() bool {
+	return b.Enabled() && openCentral != nil && config.Get().Bluetooth.ProxyConnections && linkKeyed()
+}
+
+// showConnections sets the connections switch to what is lent: saved on, and the link keyed.
+func (b *Proxy) showConnections() {
+	b.connect.Set(config.Get().Bluetooth.ProxyConnections && linkKeyed())
+}
+
+// linkKeyed reports whether the Home Assistant link has an encryption key of its own. Connections are
+// lent only then: over a link in the clear, anyone who can reach the device's port could read and write
+// the Bluetooth devices around it. A variable, for tests.
+var linkKeyed = func() bool {
+	b, err := os.ReadFile(layout.KeyPath)
+	if err != nil {
+		return false
+	}
+	k, err := esphome.ParsePSK(strings.TrimSpace(string(b)))
+	return err == nil && !k.IsZero()
+}
+
+// Reports is how many advertisements the radio has heard, for diagnostics.
+func (b *Proxy) Reports() uint64 { return b.radio.Reports() }
+
+// Features is what to advertise, which is nothing at all while the proxy is off.
+//
+// Not advertising is the only way to say the device is not a proxy, and it costs a reconnect: device
+// info is read once per connection. Reporting a stopped scanner instead does not work — Home Assistant
+// clears the scanner's current mode for any state that is not RUNNING while its requested mode stands,
+// reads the two disagreeing as a fault, and asks the user to power cycle the device. There is no state
+// in that model for a proxy its owner switched off.
+func (b *Proxy) Features() esphome.BluetoothFeature {
+	if !b.Enabled() {
+		return 0
+	}
+	if b.ConnectionsEnabled() {
+		return bluetoothFeatures | connectingFeatures | pairable
+	}
+	return bluetoothFeatures
+}
+
+// Hold turns the radio off, scanning and the iBeacon both, until release is called: for something
+// that needs the controller to itself, such as Improv advertising through bluetoothd
+// (feature/improv), which the iBeacon this radio sends on its own would otherwise talk over. It waits
+// up to holdWait for the radio to be off, and the proxy starts again as it was once the last hold is
+// released. Holds nest, and release may be called more than once.
+func (b *Proxy) Hold() (release func()) {
+	b.mu.Lock()
+	b.held++
+	b.mu.Unlock()
+	b.apply()
+	for deadline := time.Now().Add(holdWait); b.radio.Running() && time.Now().Before(deadline); {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if b.radio.Running() {
+		slog.Warn("ble: still running after being held")
+	} else {
+		slog.Info("ble: held")
+	}
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			b.mu.Lock()
+			b.held--
+			last := b.held == 0
+			b.mu.Unlock()
+			if last {
+				slog.Info("ble: released")
+			}
+			b.apply()
+		})
+	}
+}
+
+// offerer is a radio that can advertise a service of bluetoothd's itself: the Dot's raw HCI Radio.
+type offerer interface {
+	Offer(advertisement, scanResponse []byte) error
+}
+
+// ErrCannotOffer is a radio that cannot advertise for someone else, and will not while echod runs: no
+// Offer at all, or no kernel stack on hci0 to take the connection. Any other error from Offer is a
+// one-off (the radio busy, a hold gone stale) and worth trying again.
+var ErrCannotOffer = errors.New("bluetooth: this radio cannot advertise a service")
+
+// Offer lends the radio, while held, to advertise a GATT service bluetoothd serves but cannot advertise
+// itself (ble.Radio.Offer): connectable, with advertisement and scanResponse as its raw data. Done gives
+// the radio back off, for the hold's release to bring the proxy back. One at a time, and only under a
+// Hold of the caller's own.
+func (b *Proxy) Offer(advertisement, scanResponse []byte) (done func(), err error) {
+	o, ok := b.radio.(offerer)
+	if !ok {
+		return nil, ErrCannotOffer
+	}
+	b.steer.Lock()
+	defer b.steer.Unlock()
+	b.mu.Lock()
+	if b.held == 0 || b.lent {
+		b.mu.Unlock()
+		return nil, errors.New("bluetooth: Offer needs a Hold, and the radio not already lent")
+	}
+	b.lent = true
+	b.mu.Unlock()
+	if b.radio.Running() {
+		b.radio.Stop()
+	}
+	if err := o.Offer(advertisement, scanResponse); err != nil {
+		b.mu.Lock()
+		b.lent = false
+		b.mu.Unlock()
+		if errors.Is(err, ble.ErrNoKernelStack) {
+			return nil, fmt.Errorf("%w: %w", ErrCannotOffer, err)
+		}
+		return nil, err
+	}
+	slog.Info("ble: advertising a service for bluetoothd")
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			b.steer.Lock()
+			defer b.steer.Unlock()
+			b.radio.Stop()
+			b.mu.Lock()
+			b.lent = false
+			b.mu.Unlock()
+		})
+	}, nil
+}
+
+// Offering reports whether the radio is lent out to advertise a service of bluetoothd's (Offer), as
+// Improv does on a Dot. That advertisement, not the proxy's own scan, is what keeps the radio up
+// through a hold: something that needs the adapter itself, such as the wall clock pairing starting
+// discovery, must stay off it until the offer is given back.
+func (b *Proxy) Offering() bool { return b.isLent() }
+
+// holdWait is how long Hold waits for the radio to stop: a stop is a couple of HCI commands. A
+// variable for tests, which have no settle goroutine to stop it.
+var holdWait = 3 * time.Second
+
+func (b *Proxy) isLent() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.lent
+}
+
+func (b *Proxy) holding() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.held > 0
+}
+
+// apply asks for the radio to be brought in line, without waiting for it.
+func (b *Proxy) apply() {
+	select {
+	case b.wanted <- struct{}{}:
+	default:
+	}
+}
+
+// settle serializes radio changes on one goroutine. Requests react immediately to proxy state, and
+// the iBeacon payload is fixed from the factory MAC.
+func (b *Proxy) settle() {
+	settleRadio(b.wanted, func() bool { return b.tune(b.beacon) }, time.After)
+}
+
+// tune starts or stops the radio to match what is wanted, and reports which. A change of scan mode or
+// scan activity is a restart: both scanning and advertising are fixed when the controller starts.
+// It reports whether the requested state was reached; failures are retried by settle.
+func (b *Proxy) tune(beacon beaconState) bool {
+	b.steer.Lock()
+	defer b.steer.Unlock()
+	enabled := b.Enabled()
+	// Home Assistant keeps its requested scan mode while the proxy reconnects. Reporting NONE until
+	// it subscribes makes that requested/current mismatch look like a broken scanner, so subscription
+	// controls delivery below rather than whether the radio scans.
+	scan := enabled
+	if !enabled {
+		beacon = beaconState{minor: -1}
+	}
+	if b.holding() {
+		if b.isLent() {
+			return true
+		}
+		scan, beacon = false, beaconState{minor: -1}
+	}
+	want := scan || len(beacon.advertisement) != 0
+	active := b.proxy.Active()
+
+	lost := b.lost.Swap(false)
+
+	b.mu.Lock()
+	settled := want == b.radio.Running() && scan == b.radio.Scanning() &&
+		(!scan || active == b.active) && !lost
+	b.active = active
+	b.mu.Unlock()
+
+	if settled {
+		return true
+	}
+	if b.radio.Running() {
+		b.radio.Stop()
+	}
+	if !want {
+		_ = b.proxy.Report(esphome.ScannerStopped)
+		return true
+	}
+
+	if err := b.radio.Start(scan, active, beacon.advertisement, b.found); err != nil {
+		if errors.Is(err, ble.ErrScanUnavailable) {
+			slog.Debug("ble scan waiting for permission or adapter", "err", err)
+			return false
+		}
+		slog.Error("ble radio failed to start", "err", err)
+		if scan {
+			_ = b.proxy.Report(esphome.ScannerFailed)
+		}
+		return false
+	}
+	if len(beacon.advertisement) != 0 {
+		slog.Info("ble iBeacon advertising", "minor", beacon.minor)
+	}
+	if scan {
+		slog.Info("ble scanning", "active", active)
+		_ = b.proxy.Report(esphome.ScannerRunning)
+	}
+	return true
+}
+
+// found runs on the radio's reader. It must not block: anything slow here stalls the reader, and the
+// controller's queue overflows into the kernel log.
+func (b *Proxy) found(a ble.Advertisement) {
+	// The radio stays up to preserve its Home Assistant scan state, but reports have nowhere to go
+	// before a client subscribes and would only fill the queue.
+	if !b.proxy.Subscribed() {
+		return
+	}
+	select {
+	case b.reports <- a:
+	default:
+		if n := b.dropped.Add(1); n%1000 == 1 {
+			slog.Warn("ble reports dropped, home assistant is behind", "total", n)
+		}
+	}
+}
+
+// deliver batches what the radio heard and hands it over.
+func (b *Proxy) deliver() {
+	var pending []*api.BluetoothLERawAdvertisement
+
+	flush := time.NewTimer(hold)
+	defer flush.Stop()
+	flush.Stop()
+
+	send := func() {
+		if len(pending) == 0 {
+			return
+		}
+		ads := pending
+		pending = nil
+
+		if err := b.proxy.Advertise(ads); err != nil {
+			slog.Debug("ble advertisements not delivered", "count", len(ads), "err", err)
+		}
+	}
+
+	for {
+		select {
+		case a := <-b.reports:
+			pending = append(pending, &api.BluetoothLERawAdvertisement{
+				Address:     a.Addr(),
+				Rssi:        int32(a.RSSI),
+				AddressType: uint32(a.AddressType),
+				Data:        a.Data,
+			})
+			if len(pending) == 1 {
+				flush.Reset(hold)
+			}
+			if len(pending) >= batch {
+				flush.Stop()
+				send()
+			}
+
+		case <-flush.C:
+			send()
+		}
+	}
+}
