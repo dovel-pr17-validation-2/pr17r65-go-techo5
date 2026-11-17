@@ -721,7 +721,7 @@ func (p *Phone) CallAfter(number, name string, wait func(ctx context.Context) bo
 		// is limited by canceling the whole call instead.
 		unanswered := time.AfterFunc(dialFor, cancel)
 		prog := newProgress(ctx) // the ringing tone, or the far end's network, until the answer
-		d, err := l.dial(ctx, number, prog.ringing, prog.earlyMedia)
+		d, med, err := l.dial(ctx, number, prog.ringing, prog.earlyMedia)
 		unanswered.Stop()
 		prog.stop()
 		if err != nil {
@@ -735,7 +735,7 @@ func (p *Phone) CallAfter(number, name string, wait func(ctx context.Context) bo
 			return
 		}
 		defer d.Close()
-		p.talk(ctx, d.Context(), func(tctx context.Context) error { return talk(tctx, &d.DialogMedia, p.say) },
+		p.talk(ctx, d.Context(), func(tctx context.Context) error { return talk(tctx, med, p.say) },
 			func(hctx context.Context) error { return d.Hangup(hctx) })
 	})
 	return nil
@@ -776,13 +776,14 @@ func (p *Phone) incoming(d *diago.DialogServerSession) {
 	select {
 	case <-answered:
 		stopRing()
-		if err := d.Answer(); err != nil {
+		med, err := d.Answer(diago.AnswerOptions{})
+		if err != nil {
 			slog.Warn("phone: answering", "err", err)
 			fire("ended", p.State(), "reason", "answer failed")
 			p.set(func(s *State) { s.Phase, s.Peer = Idle, "" })
 			return
 		}
-		p.talk(ctx, d.Context(), func(tctx context.Context) error { return talk(tctx, &d.DialogMedia, p.say) },
+		p.talk(ctx, d.Context(), func(tctx context.Context) error { return talk(tctx, med, p.say) },
 			func(hctx context.Context) error { return d.Hangup(hctx) })
 	case <-ctx.Done():
 		stopRing()
