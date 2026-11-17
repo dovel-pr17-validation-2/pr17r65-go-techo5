@@ -148,14 +148,14 @@ func (l *line) register(ctx context.Context, registered func()) error {
 // media: its ringing tone, or an announcement such as "the number you have dialed is not available"),
 // with the media to play it from. Either may be called more than once, and neither once the call is
 // answered.
-func (l *line) dial(ctx context.Context, number string, ringing func(), early func(*diago.DialogMedia)) (*diago.DialogClientSession, error) {
+func (l *line) dial(ctx context.Context, number string, ringing func(), early func(*diago.DialogMedia)) (*diago.DialogClientSession, *diago.DialogMedia, error) {
 	u, err := l.uri(number)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	d, err := l.dg.NewDialog(u, diago.NewDialogOptions{Transport: l.tran})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	onResponse := func(res *sip.Response) error {
 		if res.StatusCode == sip.StatusRinging || (res.StatusCode == sip.StatusSessionInProgress && len(res.Body()) == 0) {
@@ -163,7 +163,7 @@ func (l *line) dial(ctx context.Context, number string, ringing func(), early fu
 		}
 		return nil
 	}
-	err = d.Invite(ctx, diago.InviteClientOptions{
+	med, err := d.Invite(ctx, diago.InviteClientOptions{
 		Username:         l.acct.Username,
 		Password:         l.acct.Password,
 		OnResponse:       onResponse,
@@ -171,8 +171,8 @@ func (l *line) dial(ctx context.Context, number string, ringing func(), early fu
 	})
 	if errors.Is(err, diago.ErrClientEarlyMedia) {
 		// The media is set up already: it plays until the far end answers, and the call goes on.
-		early(&d.DialogMedia)
-		err = d.WaitAnswer(ctx, sipgo.AnswerOptions{
+		early(med)
+		err = d.WaitAnswer(ctx, med, sipgo.AnswerOptions{
 			Username:   l.acct.Username,
 			Password:   l.acct.Password,
 			OnResponse: onResponse,
@@ -182,9 +182,9 @@ func (l *line) dial(ctx context.Context, number string, ringing func(), early fu
 		err = d.Ack(ctx)
 	}
 	if err != nil {
-		return nil, errors.Join(err, d.Close())
+		return nil, nil, errors.Join(err, d.Close())
 	}
-	return d, nil
+	return d, med, nil
 }
 
 // localAddr is the address this device reaches the provider from, which is what goes into the call's
